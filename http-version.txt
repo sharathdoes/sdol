@@ -1,0 +1,266 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+//403 spammer code
+
+// Six Degrees of Letterboxd (HTTP Version)
+
+type SearchRequest struct {
+	FromUrl string `json:"from_url"`
+	ToUrl   string `json:"to_url"`
+}
+
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "index.html")
+	})
+	http.HandleFunc("/search", SixDegreeSearch)
+	fmt.Println("six degrees of letterboxd (HTTP mode) running on http://localhost:8080")
+	http.ListenAndServe(":8080", nil)
+}
+
+func SixDegreeSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "ONLY POST ALLOWED", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req SearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "INVALID REQUEST", http.StatusBadRequest)
+		return
+	}
+	req.FromUrl = strings.TrimSpace(req.FromUrl)
+	req.ToUrl = strings.TrimSpace(req.ToUrl)
+
+	if req.FromUrl == "" || req.ToUrl == "" {
+		http.Error(w, "Both from_url and to_url are required", http.StatusBadRequest)
+		return
+	}
+
+	path, err := BFS(req.FromUrl, req.ToUrl)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "ok",
+		"path":    path,
+	})
+}
+
+func BFS(from string, to string) (string, error) {
+	if foundUrl(from, to) {
+		return from, nil
+	}
+
+	parent := make(map[string]string)
+	parent[from] = "START"
+
+	jobs := make(chan string, 50000)
+	var taskWg sync.WaitGroup
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var foundNeighbor string
+	const numWorkers = 10 // HTTP workers can be much higher since they are lightweight!
+
+	// Enqueue initial start URL
+	taskWg.Add(1)
+	jobs <- from
+
+	// Auto-cancel context when all active work items are finished
+	go func() {
+		taskWg.Wait()
+		cancel()
+	}()
+
+	// Spawn worker pool
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case url := <-jobs:
+					fmt.Printf("Scanning (HTTP): %s\n", url)
+					neighbors := GetNeighbors(url)
+
+					mu.Lock()
+					for _, neighbor := range neighbors {
+						if _, exists := parent[neighbor]; !exists {
+							parent[neighbor] = url
+
+							if foundUrl(to, neighbor) {
+								foundNeighbor = neighbor
+								cancel()
+								mu.Unlock()
+								taskWg.Done()
+								return
+							}
+
+							taskWg.Add(1)
+							select {
+							case jobs <- neighbor:
+							case <-ctx.Done():
+							}
+						}
+					}
+					mu.Unlock()
+					taskWg.Done()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if foundNeighbor != "" {
+		fmt.Printf("MATCH FOUND: %s\n", foundNeighbor)
+		return createPath(parent, foundNeighbor)
+	}
+
+	return "", fmt.Errorf("no path found")
+}
+
+func cleanUrl(u string) string {
+	u = strings.TrimSpace(strings.ToLower(u))
+	if idx := strings.Index(u, "?"); idx != -1 {
+		u = u[:idx]
+	}
+	if idx := strings.Index(u, "#"); idx != -1 {
+		u = u[:idx]
+	}
+	u = strings.TrimPrefix(u, "https://")
+	u = strings.TrimPrefix(u, "http://")
+	u = strings.TrimPrefix(u, "www.")
+	u = strings.TrimRight(u, "/")
+	return u
+}
+
+func isValidLetterboxdLink(link string) bool {
+	if !strings.HasPrefix(link, "https://letterboxd.com/") {
+		return false
+	}
+
+	isCanonical := strings.HasPrefix(link, "https://letterboxd.com/film/") ||
+		strings.HasPrefix(link, "https://letterboxd.com/actor/") ||
+		strings.HasPrefix(link, "https://letterboxd.com/director/")
+
+	if !isCanonical {
+		return false
+	}
+
+	badSubpages := []string{"/reviews/", "/lists/", "/ratings/", "/fans/", "/crew/", "/details/", "/contribute/"}
+	for _, sub := range badSubpages {
+		if strings.Contains(link, sub) {
+			return false
+		}
+	}
+
+	return !strings.Contains(link, "?") && !strings.Contains(link, "#")
+}
+
+func foundUrl(a, b string) bool {
+	return cleanUrl(a) == cleanUrl(b)
+}
+
+// Regex to extract href attributes from HTML without heavy parsers
+var hrefRegex = regexp.MustCompile(`href="([^"]+)"`)
+
+func GetNeighbors(url string) []string {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return []string{}
+	}
+
+	// Mimic a real browser User-Agent to avoid immediate rejection
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return []string{}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("   [Debug] HTTP Status %d on %s\n", resp.StatusCode, url)
+		return []string{}
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return []string{}
+	}
+	htmlContent := string(bodyBytes)
+
+	// Extract all hrefs using regex
+	matches := hrefRegex.FindAllStringSubmatch(htmlContent, -1)
+	var links []string
+
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		href := match[1]
+
+		var fullURL string
+		if strings.HasPrefix(href, "/") {
+			fullURL = "https://letterboxd.com" + href
+		} else if strings.HasPrefix(href, "https://letterboxd.com/") {
+			fullURL = href
+		} else {
+			continue
+		}
+
+		if !strings.HasSuffix(fullURL, "/") && !strings.Contains(fullURL, "?") && !strings.Contains(fullURL, "#") {
+			fullURL += "/"
+		}
+
+		if isValidLetterboxdLink(fullURL) {
+			links = append(links, fullURL)
+		}
+	}
+
+	return links
+}
+
+func createPath(parent map[string]string, neighbor string) (string, error) {
+	var steps []string
+	curr := neighbor
+
+	for curr != "START" && curr != "" {
+		steps = append(steps, curr)
+		curr = parent[curr]
+	}
+
+	for i, j := 0, len(steps)-1; i < j; i, j = i+1, j-1 {
+		steps[i], steps[j] = steps[j], steps[i]
+	}
+
+	return strings.Join(steps, " -> "), nil
+}
